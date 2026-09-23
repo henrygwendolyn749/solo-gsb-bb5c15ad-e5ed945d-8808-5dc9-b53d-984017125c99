@@ -48,3 +48,12 @@ class AddressBatchIn(BaseModel):
 class ReviewAction(BaseModel):
     action: str = Field(..., pattern="^(confirmed|overridden|rejected)$")
     selected_id: int | None = None
+
+
+class GroupReviewAction(BaseModel):
+    """One decision applied to a whole 同案 group in a single transaction."""
+    action: str = Field(..., pattern="^(confirmed|overridden|rejected)$")
+    signature: str = Field(..., min_length=1,
+                           description="GET /api/review-groups 返回的组签名")
+    member_ids: list[int] = Field(..., min_length=1)
+    selected_id: int | None = None

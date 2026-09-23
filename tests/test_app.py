@@ -365,3 +365,257 @@ def test_preview_invalid_lines_use_physical_numbers(client):
     assert data["valid"] == 1
     assert data["invalid"] == 1
     assert data["invalid_lines"] == [4]
+
+
+# --------------------------------------------------------- merged 同案 review
+
+
+def _upload_group_address(client, prefix: str) -> int:
+    """Upload a unique low-scoring address; return its standard-address id."""
+    csv_bytes = (
+        f"external_id,address,city,state\n"
+        f"{prefix}-STD,{prefix} Group Way,{prefix}ville,GT\n"
+    ).encode()
+    r = client.post("/api/addresses/upload",
+                    files={"file": ("g.csv", csv_bytes, "text/csv")})
+    assert r.status_code == 200
+    assert r.json()["inserted"] == 1
+    listing = client.get("/api/addresses?limit=500").json()
+    return next(a["id"] for a in listing["items"] if a["external_id"] == f"{prefix}-STD")
+
+
+def _match_three_variants(client, prefix: str) -> list[int]:
+    """Three spellings that normalise to the exact same address.
+
+    The standard address has no house number, so supplying one keeps every
+    variant in needs_review (token F1 1.0 but house score 0.15) while sharing
+    the exact same normalised road/locality/house signature.
+    """
+    queries = [
+        f"99 {prefix} Group Way, {prefix}ville GT",
+        f"99 {prefix} GROUP way, {prefix}ville GT",
+        f"99 {prefix} Group Way!!!, {prefix}ville, GT",
+    ]
+    ids = []
+    for q in queries:
+        r = client.post("/api/match", json={"query": q})
+        assert r.json()["status"] == "needs_review", q
+        ids.append(r.json()["match_id"])
+    assert len(set(ids)) == 3
+    return ids
+
+
+def _find_group(client, member_ids):
+    data = client.get("/api/review-groups").json()
+    wanted = set(member_ids)
+    matches = [g for g in data["items"] if set(g["member_ids"]) == wanted]
+    assert len(matches) == 1, data
+    return matches[0]
+
+
+def test_review_groups_endpoint_and_signature_rules(client):
+    addr_id = _upload_group_address(client, "ALPHA")
+    ids = _match_three_variants(client, "ALPHA")
+
+    data = client.get("/api/review-groups").json()
+    assert data["total"] >= 1
+    group = _find_group(client, ids)
+    assert group["member_count"] == 3
+    # Original queries (and count) are exposed for the web page.
+    assert [q["id"] for q in group["queries"]] == sorted(ids)
+    assert all("query" in q for q in group["queries"])
+    assert group["best_id"] == addr_id
+    assert [c["address"]["id"] for c in group["candidates"]]
+
+    # A different house number is a different signature -> not grouped.
+    r = client.post("/api/match", json={"query": "999 ALPHA Group Way, ALPHAVILLE GT"})
+    assert r.json()["status"] == "needs_review"
+    group_after = _find_group(client, ids)
+    assert r.json()["match_id"] not in group_after["member_ids"]
+
+    # Different candidate score content also splits groups: the only candidate
+    # here is a brand-new address of its own.
+    other = _upload_group_address(client, "BRAVO")
+    r = client.post("/api/match", json={"query": "99 BRAVO Group Way, BRAVOVILLE GT"})
+    assert r.json()["status"] == "needs_review"
+    data = client.get("/api/review-groups").json()
+    singleton = [g for g in data["items"]
+                 if r.json()["match_id"] in g["member_ids"]]
+    assert singleton == []  # a lone record is not a group (needs 2+ members)
+    assert other
+
+
+def test_group_confirm_applies_to_all_members(client):
+    _upload_group_address(client, "CHARLIE")
+    ids = _match_three_variants(client, "CHARLIE")
+    group = _find_group(client, ids)
+
+    r = client.post("/api/review-groups/review", json={
+        "action": "confirmed",
+        "signature": group["signature"],
+        "member_ids": group["member_ids"],
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["count"] == 3
+    assert {x["match_id"] for x in body["reviewed"]} == set(ids)
+
+    for log_id in ids:
+        detail = client.get(f"/api/matches/{log_id}").json()
+        assert detail["status"] == "reviewed"
+        assert detail["review_action"] == "confirmed"
+        assert detail["selected_id"] == group["best_id"]
+        assert detail["score"] == group["best_score"]
+
+    # The group vanishes from the pending queue.
+    data = client.get("/api/review-groups").json()
+    assert all(not (set(ids) & set(g["member_ids"])) for g in data["items"])
+
+
+def test_group_conflict_when_member_already_reviewed_writes_nothing(client):
+    _upload_group_address(client, "DELTA")
+    ids = _match_three_variants(client, "DELTA")
+    group = _find_group(client, ids)
+
+    # A parallel reviewer handles one member singly first.
+    r = client.post(f"/api/matches/{ids[0]}/review", json={"action": "rejected"})
+    assert r.status_code == 200
+
+    # The stale group decision must fail with 409 and write nothing else.
+    r = client.post("/api/review-groups/review", json={
+        "action": "confirmed",
+        "signature": group["signature"],
+        "member_ids": group["member_ids"],
+    })
+    assert r.status_code == 409
+    for log_id in ids[1:]:
+        detail = client.get(f"/api/matches/{log_id}").json()
+        assert detail["status"] == "needs_review"
+        assert detail["review_action"] is None
+
+    # The live group endpoint now reports the remaining two members only.
+    fresh = client.get("/api/review-groups").json()
+    survivor_groups = [g for g in fresh["items"] if ids[1] in g["member_ids"]]
+    assert len(survivor_groups) == 1
+    assert survivor_groups[0]["member_ids"] == ids[1:]
+
+
+def test_group_conflict_when_member_set_grows(client):
+    _upload_group_address(client, "ECHO")
+    ids = _match_three_variants(client, "ECHO")
+    group = _find_group(client, ids)
+
+    # A new duplicate arrives before the decision is posted: same signature,
+    # one more member.
+    r = client.post("/api/match", json={"query": "99 ECHO Group Way, ECHOVILLE, GT"})
+    new_id = r.json()["match_id"]
+    assert r.json()["status"] == "needs_review"
+
+    r = client.post("/api/review-groups/review", json={
+        "action": "rejected",
+        "signature": group["signature"],
+        "member_ids": group["member_ids"],
+    })
+    assert r.status_code == 409
+    # Nothing was written, including the newcomer.
+    for log_id in ids + [new_id]:
+        assert client.get(f"/api/matches/{log_id}").json()["status"] == "needs_review"
+
+    # Re-fetch and act on the full current set.
+    grown = _find_group(client, ids + [new_id])
+    assert grown["member_count"] == 4
+    r = client.post("/api/review-groups/review", json={
+        "action": "rejected",
+        "signature": grown["signature"],
+        "member_ids": grown["member_ids"],
+    })
+    assert r.status_code == 200
+    assert r.json()["count"] == 4
+    for log_id in ids + [new_id]:
+        detail = client.get(f"/api/matches/{log_id}").json()
+        assert detail["status"] == "reviewed"
+        assert detail["review_action"] == "rejected"
+        assert detail["selected_id"] is None
+
+
+def test_group_override_uses_each_members_candidate_score(client):
+    _upload_group_address(client, "FOXTROT")
+    ids = _match_three_variants(client, "FOXTROT")
+    group = _find_group(client, ids)
+    # A near-twin address adds a shared candidate (token F1 ~0.8, house match)
+    # so an override target exists and the recorded score is the candidate-
+    # specific one, not the preferred candidate's score.
+    csv_bytes = b"external_id,address,city,state\nFOXTROT-DEC,FOXTROT Group Way North,FOXTROTVILLE,GT\n"
+    assert client.post("/api/addresses/upload",
+                       files={"file": ("d.csv", csv_bytes, "text/csv")}).status_code == 200
+
+    # New logs against the two-candidate table with identical normalised text.
+    pair = []
+    for q in ("99 FOXTROT Group Way, FOXTROTVILLE, GT!!", "99 FOXTROT group way, FOXTROTVILLE, gt"):
+        r = client.post("/api/match", json={"query": q})
+        pair.append(r.json()["match_id"])
+    two_cand = client.get(f"/api/matches/{pair[0]}").json()
+    decoy_id = next(
+        c["address"]["id"] for c in two_cand["candidates"]
+        if c["address"]["external_id"] == "FOXTROT-DEC"
+    )
+    score_for_decoy = next(
+        c["score"] for c in two_cand["candidates"]
+        if c["address"]["id"] == decoy_id
+    )
+    # The override target is a real but non-preferred candidate.
+    assert two_cand["candidate_id"] != decoy_id
+    assert score_for_decoy != two_cand["score"]
+    g = _find_group(client, pair)
+
+    r = client.post("/api/review-groups/review", json={
+        "action": "overridden",
+        "signature": g["signature"],
+        "member_ids": g["member_ids"],
+        "selected_id": decoy_id,
+    })
+    assert r.status_code == 200
+    for log_id in pair:
+        detail = client.get(f"/api/matches/{log_id}").json()
+        assert detail["review_action"] == "overridden"
+        assert detail["selected_id"] == decoy_id
+        assert detail["score"] == score_for_decoy
+
+    # Overriding to an id outside the candidate list is a 409 conflict and
+    # writes nothing.
+    _upload_group_address(client, "GOLF")
+    leftover = _find_group(client, ids)
+    stranger = client.get("/api/addresses?limit=500").json()
+    stranger_id = next(a["id"] for a in stranger["items"]
+                       if a["external_id"] == "GOLF-STD")
+    r = client.post("/api/review-groups/review", json={
+        "action": "overridden",
+        "signature": leftover["signature"],
+        "member_ids": leftover["member_ids"],
+        "selected_id": stranger_id,
+    })
+    assert r.status_code == 409
+    for log_id in ids:
+        assert client.get(f"/api/matches/{log_id}").json()["status"] == "needs_review"
+
+
+def test_group_review_validates_payload(client):
+    _upload_group_address(client, "HOTEL")
+    ids = _match_three_variants(client, "HOTEL")
+    group = _find_group(client, ids)
+
+    # Override without selected_id -> 400
+    r = client.post("/api/review-groups/review", json={
+        "action": "overridden",
+        "signature": group["signature"],
+        "member_ids": group["member_ids"],
+    })
+    assert r.status_code == 400
+
+    # Unknown signature -> 409 (the member set under that signature is empty)
+    r = client.post("/api/review-groups/review", json={
+        "action": "rejected",
+        "signature": "deadbeef",
+        "member_ids": group["member_ids"],
+    })
+    assert r.status_code == 409

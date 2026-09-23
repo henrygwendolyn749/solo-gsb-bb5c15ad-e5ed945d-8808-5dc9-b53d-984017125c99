@@ -7,7 +7,8 @@
 可复核结果。
 
 - 🌐 网页界面：单条/批量匹配、上传标准地址 CSV、待确认队列人工复核
-- 🔌 REST API：`/api/match`、`/api/match/batch`、`/api/addresses`、复核接口（含 `/docs` Swagger）
+- 🧩 **同案合并复核**：归一化道路/地区词元与门牌号相同、且候选 ID 顺序与得分完全一致的待确认记录自动成组，可整组一次确认/改派/判无匹配，组内单条复核仍然保留
+- 🔌 REST API：`/api/match`、`/api/match/batch`、`/api/addresses`、单条复核、同案分组与整组复核接口（含 `/docs` Swagger）
 - 🗄️ SQLite 持久化，零外部依赖，数据通过 Docker volume 保存
 - 🌍 归一化：NFKC + 变音符折叠 + 繁简中文映射 + 全角字符、道路缩写（St/Rd/Ave…）、门牌号（`#12-B`/`No.12b`/`12号`）
 
@@ -26,19 +27,33 @@ docker compose up --build
 | 网页界面 | http://localhost:8000 |
 | REST API 文档（Swagger） | http://localhost:8000/docs |
 | 健康检查 | http://localhost:8000/api/health |
+| 待确认单条列表 API | http://localhost:8000/api/matches?status=needs_review |
+| 同案分组 API | http://localhost:8000/api/review-groups |
 
 - **端口**：`8000`（在 `docker-compose.yml` 的 `ports` 中修改）
 - 首次启动会自动加载内置示例标准地址（`sample_data/standard_addresses.csv`，共 15 条，含中英文地址）
 - SQLite 数据库保存在 Docker volume `address-data`（容器内 `/data/addresses.db`），重启不丢失
 
-不用 Docker 时：
+不用 Docker 时，**单条启动命令**（自动建库、自动加载示例数据）：
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements.txt && \
 ADDRESS_DB_PATH=./data/addresses.db \
 SAMPLE_CSV=./sample_data/standard_addresses.csv \
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
+
+### 必要配置（环境变量，均有默认值）
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `ADDRESS_DB_PATH` | `/data/addresses.db`（Docker）/ 需自行指定（本地） | SQLite 数据库文件路径 |
+| `SAMPLE_CSV` | `/app/sample_data/standard_addresses.csv` | 首次启动自动加载的示例 CSV |
+| `AUTO_THRESHOLD` | `0.80` | 自动命中的最低综合得分 |
+| `MARGIN_THRESHOLD` | `0.06` | 前两名最小领先分差，小于则待确认 |
+| `REJECT_THRESHOLD` | `0.35` | 低于此分判定无匹配 |
+| `TOKEN_WEIGHT` | `0.7` | 词元得分权重（其余为门牌号权重） |
+| `HOST` / `PORT` | `0.0.0.0` / `8000` | 监听地址与端口 |
 
 ---
 
@@ -85,6 +100,29 @@ curl -s -X POST http://localhost:8000/api/match \
 curl -s -X POST http://localhost:8000/api/match/batch \
   -H 'Content-Type: application/json' \
   -d '{"queries": ["123 main st ny", "88 Beijing East Rd Shanghai", "xxxxx"]}'
+```
+
+同案合并复核（先查组，再对整组下决定；下方用 `jq` 取第一组）：
+
+```bash
+# 1) 查看同案组（组内原始查询、数量、候选、组签名）
+curl -s http://localhost:8000/api/review-groups | jq '.items[0]'
+
+# 2) 整组确认首选
+curl -s -X POST http://localhost:8000/api/review-groups/review \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"confirmed","signature":"<组签名>","member_ids":[101,102]}'
+
+# 3) 整组改派为共同候选（selected_id 必须是每个成员共同候选中的一个）
+curl -s -X POST http://localhost:8000/api/review-groups/review \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"overridden","signature":"<组签名>","member_ids":[101,102],"selected_id":8}'
+
+# 4) 整组判无匹配
+curl -s -X POST http://localhost:8000/api/review-groups/review \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"rejected","signature":"<组签名>","member_ids":[101,102]}'
+# 成员已被单条复核 / 有新同案加入 / 签名变化 -> 409，整笔不写入
 ```
 
 上传自己的标准地址表（直接上传，服务端解析后立即写入并跳过重复）：
@@ -176,6 +214,16 @@ CSV 支持的列名（均可识别别名，表头大小写不敏感）：
    `POST /api/matches/{id}/review` 执行 `confirmed`（确认首选）、
    `overridden`（改派为其他候选，带 `selected_id`）、`rejected`（标记无匹配）。
 
+6. **同案合并复核**：待确认记录按以下归一化结果计算**组签名**并归组——
+   道路词元集合、地区词元集合、门牌号，加上候选地址 **ID 的有序列表**与
+   各候选**得分**；只有这些全部相同的记录才同组（单条记录不成为组）。
+   网页队列顶部展示每个同案组的**组内原始查询与数量**，可对整组执行
+   确认首选 / 改派共同候选 / 判无匹配；展开「对组内单条记录分别复核」仍可
+   逐单处理。整组请求提交后，服务端在**一个 SQLite 写事务**
+   （`BEGIN IMMEDIATE`）内重新核对：每个成员仍为待确认、组签名未变、
+   成员集合（无新增也无减少）未变；任一不符返回 `409 Conflict` 且**一条也不写**。
+   成功后为每条成员分别写入复核决定与各自候选对应的得分。
+
 ---
 
 ## API 速览
@@ -193,7 +241,9 @@ CSV 支持的列名（均可识别别名，表头大小写不敏感）：
 | POST | `/api/match/batch` | 批量地址匹配 |
 | GET | `/api/matches?status=needs_review` | 匹配记录/待确认队列 |
 | GET | `/api/matches/{id}` | 单条匹配详情 |
-| POST | `/api/matches/{id}/review` | 复核：confirmed / overridden / rejected |
+| POST | `/api/matches/{id}/review` | 复核（单条，原有）：confirmed / overridden / rejected |
+| GET | `/api/review-groups` | 待确认同案组：归一化道路/地区词元+门牌号相同、候选 ID 顺序与得分相同（≥2 条） |
+| POST | `/api/review-groups/review` | 整组复核：单事务内重校成员状态/组签名/成员集合，冲突返回 409 且不写入 |
 
 匹配结果示例（节选）：
 
@@ -235,6 +285,7 @@ CSV 支持的列名（均可识别别名，表头大小写不敏感）：
 │   ├── db.py              # SQLite 表结构与读写
 │   ├── normalization.py   # Unicode/缩写/门牌号归一化与分词
 │   ├── matcher.py         # 词元与门牌号相似度、候选判定
+│   ├── groups.py          # 同案组签名、分组查询、事务内整组复核
 │   ├── ingest.py          # CSV / JSON 标准地址导入
 │   ├── schemas.py         # Pydantic 模型
 │   ├── templates/         # 网页（Jinja2，单页）

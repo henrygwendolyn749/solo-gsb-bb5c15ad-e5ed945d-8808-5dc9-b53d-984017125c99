@@ -298,6 +298,28 @@ def get_match_log(conn: sqlite3.Connection, log_id: int) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM match_logs WHERE id = ?", (log_id,)).fetchone()
 
 
+def get_match_logs(conn: sqlite3.Connection, log_ids: list[int]) -> list[sqlite3.Row]:
+    """Fetch several match logs by id (returns one row per existing id)."""
+    if not log_ids:
+        return []
+    placeholders = ",".join("?" for _ in log_ids)
+    return conn.execute(
+        f"SELECT * FROM match_logs WHERE id IN ({placeholders})",
+        list(log_ids),
+    ).fetchall()
+
+
+def list_match_logs_by_status(conn: sqlite3.Connection,
+                              status: str) -> list[sqlite3.Row]:
+    """Return every log in the given status, ordered by id (no pagination).
+
+    Used inside write transactions to recompute review-group membership.
+    """
+    return conn.execute(
+        "SELECT * FROM match_logs WHERE status = ? ORDER BY id", (status,)
+    ).fetchall()
+
+
 def review_match_log(conn: sqlite3.Connection, log_id: int, *, action: str,
                      selected_id: int | None, score: float | None) -> None:
     conn.execute(

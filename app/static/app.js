@@ -94,9 +94,17 @@ function renderConflicts(conflicts) {
 function renderCandidate(cand, rank, opts = {}) {
     const a = cand.address;
     const bestCls = rank === 0 ? " best" : "";
-    const actionAttrs = opts.reviewable
+    const actionAttrs = opts.reviewable && !opts.group
         ? `data-log="${opts.logId}" data-address="${a.id}"`
         : "";
+    // Whole-group (同案) action buttons carry the group signature + member set
+    // instead of a single log id.
+    const groupAttrs = opts.group
+        ? `data-group="1" data-signature="${escapeHtml(opts.signature)}" ` +
+          `data-members='${escapeHtml(JSON.stringify(opts.memberIds))}' data-address="${a.id}"`
+        : "";
+    const confirmCls = opts.group ? "group-confirm" : "candidate-confirm";
+    const overrideCls = opts.group ? "group-override" : "candidate-override";
     return `
     <div class="candidate${bestCls}">
         <div class="addr">#${rank + 1} ${escapeHtml(a.full_text)}</div>
@@ -114,8 +122,8 @@ function renderCandidate(cand, rank, opts = {}) {
         ${renderConflicts(cand.conflicts)}
         ${opts.reviewable ? `
         <div class="review-actions">
-            <button class="tiny confirm candidate-confirm" ${actionAttrs}>确认此候选</button>
-            ${rank !== 0 ? `<button class="tiny override candidate-override" ${actionAttrs}>改派为该候选</button>` : ""}
+            <button class="tiny confirm ${confirmCls}" ${actionAttrs}${groupAttrs}>确认此候选${opts.group ? "（整组）" : ""}</button>
+            ${rank !== 0 ? `<button class="tiny override ${overrideCls}" ${actionAttrs}${groupAttrs}>改派为该候选${opts.group ? "（整组）" : ""}</button>` : ""}
         </div>` : ""}
     </div>`;
 }
@@ -430,9 +438,57 @@ $("#csv-preview-panel").addEventListener("click", async (event) => {
 
 // ------------------------------------------------------------- review queue
 
+function renderReviewGroup(group) {
+    const candidateHtml = group.candidates.length
+        ? group.candidates.map((c, i) => renderCandidate(c, i, {
+            reviewable: true,
+            group: true,
+            signature: group.signature,
+            memberIds: group.member_ids,
+        })).join("")
+        : '<div class="meta muted">无候选</div>';
+    const queriesHtml = group.queries.map((m) => `
+        <li>🔍 ${escapeHtml(m.query)}
+            <span class="muted">（记录 #${m.id}）</span>
+        </li>`).join("");
+    const memberDataAttr =
+        `data-group="1" data-signature="${escapeHtml(group.signature)}" ` +
+        `data-members='${escapeHtml(JSON.stringify(group.member_ids))}'`;
+    return `
+    <div class="review-group">
+        <div class="group-head">
+            <span class="group-badge">同案合并 × ${group.member_count}</span>
+            <span class="muted">归一化：${escapeHtml(group.normalized.text || "（空）")}
+                · 门牌号 <b>${escapeHtml(group.normalized.house || "无")}</b></span>
+        </div>
+        <ul class="group-queries">${queriesHtml}</ul>
+        ${candidateHtml}
+        <div class="review-actions">
+            <button class="tiny reject group-reject" ${memberDataAttr}>整组标记为无匹配</button>
+        </div>
+        <details class="single-review-toggle">
+            <summary>对组内单条记录分别复核（原有单条复核）</summary>
+            ${group.queries.map((m) => `
+            <div class="single-member">
+                <div class="query-line">🔍 ${escapeHtml(m.query)}</div>
+                <div class="muted">记录 #${m.id} · ${escapeHtml(m.created_at || "")}</div>
+                ${(group.candidates || []).map((c, i) => renderCandidate(c, i, {
+                    reviewable: true,
+                    logId: m.id,
+                })).join("")}
+                <div class="review-actions">
+                    <button class="tiny reject candidate-reject" data-log="${m.id}">标记为无匹配</button>
+                </div>
+            </div>`).join("")}
+        </details>
+    </div>`;
+}
+
 async function loadReview() {
     const status = $("#review-filter").value;
     const list = $("#review-list");
+    const groupBox = $("#review-groups");
+    groupBox.innerHTML = "";
     list.innerHTML = '<p class="muted">加载中…</p>';
     try {
         const data = await api(`/api/matches?status=${encodeURIComponent(status)}&limit=100`);
@@ -440,8 +496,26 @@ async function loadReview() {
             list.innerHTML = '<p class="muted">暂无记录。</p>';
             return;
         }
-        list.innerHTML = data.items.map((item) => {
-            const best = item.candidates[0];
+
+        // Only the pending view offers 同案 groups; reviewed/other filters keep
+        // the flat single-record layout.
+        let groupedIds = new Set();
+        if (status === "needs_review") {
+            const gd = await api("/api/review-groups");
+            if (gd.items.length) {
+                groupBox.innerHTML =
+                    `<p class="muted">检测到 ${gd.items.length} 个同案组，可整组复核：</p>` +
+                    gd.items.map(renderReviewGroup).join("");
+                groupedIds = new Set(gd.items.flatMap((g) => g.member_ids));
+            }
+        }
+
+        const singles = data.items.filter((item) => !groupedIds.has(item.id));
+        if (singles.length === 0 && groupedIds.size) {
+            list.innerHTML = '<p class="muted">其余待确认记录均已归入上方同案组。</p>';
+            return;
+        }
+        list.innerHTML = singles.map((item) => {
             const candidateHtml = item.candidates.length
                 ? item.candidates.map((c, i) => renderCandidate(c, i, {
                     reviewable: item.status === "needs_review",
@@ -468,7 +542,57 @@ async function loadReview() {
 
 $("#btn-refresh-review").addEventListener("click", loadReview);
 $("#review-filter").addEventListener("change", loadReview);
+
+// Whole-group (同案) review actions.
+async function onGroupReviewClick(btn) {
+    const signature = btn.dataset.signature;
+    let memberIds;
+    try {
+        memberIds = JSON.parse(btn.dataset.members || "[]");
+    } catch {
+        memberIds = [];
+    }
+    let body;
+    if (btn.classList.contains("group-reject")) {
+        body = { action: "rejected", signature, member_ids: memberIds };
+    } else {
+        body = {
+            action: btn.classList.contains("group-override") ? "overridden" : "confirmed",
+            signature,
+            member_ids: memberIds,
+            selected_id: Number(btn.dataset.address),
+        };
+    }
+    btn.disabled = true;
+    try {
+        const res = await api("/api/review-groups/review", {
+            method: "POST",
+            body: JSON.stringify(body),
+        });
+        btn.textContent = `✓ 整组已记录（${res.count} 条）`;
+        btn.classList.add("confirm");
+        await refreshHealth();
+        return true;
+    } catch (err) {
+        btn.disabled = false;
+        // 409-style state drift: tell the user and refresh the queue.
+        alert(`${err.message}（页面将自动刷新）`);
+        return false;
+    }
+}
+
 $("#review-list").addEventListener("click", async (event) => {
+    await onReviewClick(event);
+    if (event.target.closest("button[data-log]")) loadReview();
+});
+$("#review-groups").addEventListener("click", async (event) => {
+    const groupBtn = event.target.closest("button[data-group]");
+    if (groupBtn) {
+        await onGroupReviewClick(groupBtn);
+        loadReview();
+        return;
+    }
+    // Single-record buttons rendered inside a group's <details>.
     await onReviewClick(event);
     if (event.target.closest("button[data-log]")) loadReview();
 });

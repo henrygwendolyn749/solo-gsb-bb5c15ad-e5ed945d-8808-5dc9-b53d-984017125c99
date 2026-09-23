@@ -70,6 +70,10 @@
     <section id="tab-review" class="panel">
         <div class="card">
             <h2>待确认队列</h2>
+            <p class="hint">
+                归一化后<b>道路词元、地区词元、门牌号</b>相同，且候选地址 ID 顺序与得分完全一致的待确认记录会自动合并为
+                <b>同案组</b>，可整组一次确认/改派/判无匹配；组内每条记录仍可单独复核。
+            </p>
             <div class="row">
                 <select id="review-filter">
                     <option value="needs_review">仅待确认</option>
@@ -80,6 +84,7 @@
                 </select>
                 <button id="btn-refresh-review" class="ghost">刷新</button>
             </div>
+            <div id="review-groups"></div>
             <div id="review-list"></div>
         </div>
     </section>

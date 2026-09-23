@@ -11,10 +11,16 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from . import db, ingest
+from . import db, groups, ingest
 from .config import Settings, get_settings
 from .matcher import candidate_to_dict, match_address, result_to_dict
-from .schemas import AddressBatchIn, BatchMatchRequest, MatchRequest, ReviewAction
+from .schemas import (
+    AddressBatchIn,
+    BatchMatchRequest,
+    GroupReviewAction,
+    MatchRequest,
+    ReviewAction,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -319,3 +325,41 @@ def review_match(match_id: int, payload: ReviewAction,
         )
     return {"ok": True, "match_id": match_id, "action": payload.action,
             "selected_id": payload.selected_id}
+
+
+# --- merged (同案) review groups ---------------------------------------------
+
+
+@app.get("/api/review-groups")
+def list_review_groups(conn: db.sqlite3.Connection = Depends(get_conn)
+                       ) -> dict[str, Any]:
+    """Pending logs that share normalised road/locality/house number plus an
+    identical ordered candidate list (ids + scores). Only groups with 2+
+    members are returned; single records keep using the one-by-one API."""
+    items = groups.list_review_groups(conn)
+    return {"total": len(items), "items": items}
+
+
+@app.post("/api/review-groups/review")
+def review_group(payload: GroupReviewAction,
+                 conn: db.sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
+    """Apply one decision (confirm preferred / override shared candidate /
+    reject as no-match) to a whole group.
+
+    The server re-checks inside a single SQLite write transaction that every
+    member is still pending, still carries the submitted group signature and
+    that the member set is unchanged. Any drift returns ``409`` and writes
+    nothing; success records a decision and its corresponding score per row.
+    """
+    try:
+        return groups.apply_group_review(
+            conn,
+            action=payload.action,
+            signature=payload.signature,
+            member_ids=payload.member_ids,
+            selected_id=payload.selected_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except groups.GroupConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
