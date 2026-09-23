@@ -20,6 +20,7 @@ _FIELD_ALIASES: dict[str, str] = {
     "addr": "full_text",
     "formatted_address": "full_text",
     "full_address": "full_text",
+    "full_text": "full_text",
     "standard_address": "full_text",
     "line1": "line1",
     "street": "line1",

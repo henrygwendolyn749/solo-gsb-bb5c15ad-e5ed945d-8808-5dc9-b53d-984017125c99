@@ -6,10 +6,11 @@
 过小的候选会被标记为 **待确认（needs_review）**，并在界面上展示命中词元、冲突字段与
 可复核结果。
 
-- 🌐 网页界面：单条/批量匹配、上传标准地址 CSV、待确认队列人工复核
+- 🌐 网页界面：单条/批量匹配、上传标准地址 CSV、待确认队列人工复核（含同案合并复核）
 - 🔌 REST API：`/api/match`、`/api/match/batch`、`/api/addresses`、复核接口（含 `/docs` Swagger）
 - 🗄️ SQLite 持久化，零外部依赖，数据通过 Docker volume 保存
 - 🌍 归一化：NFKC + 变音符折叠 + 繁简中文映射 + 全角字符、道路缩写（St/Rd/Ave…）、门牌号（`#12-B`/`No.12b`/`12号`）
+- 👥 同案合并复核：归一化后道路/地区词元与门牌号一致、且候选（ID/顺序/得分）完全相同的待确认记录自动归组，可整组确认首选、改派共同候选或判无匹配；整组写入在单个 SQLite 写事务内完成，组成员或签名有变化即整体冲突回滚
 
 ---
 
@@ -176,6 +177,35 @@ CSV 支持的列名（均可识别别名，表头大小写不敏感）：
    `POST /api/matches/{id}/review` 执行 `confirmed`（确认首选）、
    `overridden`（改派为其他候选，带 `selected_id`）、`rejected`（标记无匹配）。
 
+6. **同案合并复核**（`app/review_groups.py`）
+   - **归组规则**：待确认记录按查询归一化后的 **道路词元 + 地区词元 + 门牌号**
+     归组；同一归一化桶内，只有 **候选地址 ID、顺序及得分完全相同** 的记录才进入
+     同组（组签名 = 归一化键 + 有序 `[候选ID, 得分]` 序列的 SHA-256）。匹配是确定性的，
+     因此同一标准地址表下写法不同的同案查询自然同组；若两次匹配之间标准地址表
+     发生变化导致候选不同，则自动拆分为不同组，不会误并。
+   - **网页展示**：「待确认队列」页顶部列出成员数 ≥ 2 的同案组，展示组内
+     **原始查询及数量**、归一化键与共同候选；原有单条复核在下方列表中保留。
+   - **整组复核**：`GET /api/review-groups` 查看分组，
+     `POST /api/review-groups/review` 携带 `group_key` 与客户端看到的
+     `match_ids` 执行整组 `confirmed` / `overridden`（改派共同候选，带
+     `selected_id`，必须是组内共同候选之一）/ `rejected`。
+   - **事务保证**：服务端在 **同一个 SQLite 写事务**（`BEGIN IMMEDIATE`）内
+     重新归组并核对：每位成员仍为待确认、组签名与成员集合均未变化，才逐条写入
+     复核决定与对应得分（确认首选记各成员自己的首选及得分，改派记共同候选的得分，
+     判无匹配清空选中与得分）；任一核对失败即返回 `409` 冲突且 **一条也不写**，
+     客户端刷新后重试。
+
+```bash
+# 查看同案分组（仅含待确认记录）
+curl -s http://localhost:8000/api/review-groups
+
+# 整组确认首选 / 改派共同候选 / 判无匹配
+curl -s -X POST http://localhost:8000/api/review-groups/review \
+  -H 'Content-Type: application/json' \
+  -d '{"group_key": "<上一步返回的 group_key>", "match_ids": [1,2,3],
+       "action": "confirmed"}'
+```
+
 ---
 
 ## API 速览
@@ -193,7 +223,9 @@ CSV 支持的列名（均可识别别名，表头大小写不敏感）：
 | POST | `/api/match/batch` | 批量地址匹配 |
 | GET | `/api/matches?status=needs_review` | 匹配记录/待确认队列 |
 | GET | `/api/matches/{id}` | 单条匹配详情 |
-| POST | `/api/matches/{id}/review` | 复核：confirmed / overridden / rejected |
+| POST | `/api/matches/{id}/review` | 单条复核：confirmed / overridden / rejected |
+| GET | `/api/review-groups` | 待确认记录的同案分组（归一化键 + 候选签名归组，含组内原始查询与数量） |
+| POST | `/api/review-groups/review` | 整组复核：单事务核对组签名与成员集合，冲突返回 409 且一条不写 |
 
 匹配结果示例（节选）：
 
@@ -235,6 +267,7 @@ CSV 支持的列名（均可识别别名，表头大小写不敏感）：
 │   ├── db.py              # SQLite 表结构与读写
 │   ├── normalization.py   # Unicode/缩写/门牌号归一化与分词
 │   ├── matcher.py         # 词元与门牌号相似度、候选判定
+│   ├── review_groups.py   # 同案合并复核：归组与整组事务写入
 │   ├── ingest.py          # CSV / JSON 标准地址导入
 │   ├── schemas.py         # Pydantic 模型
 │   ├── templates/         # 网页（Jinja2，单页）

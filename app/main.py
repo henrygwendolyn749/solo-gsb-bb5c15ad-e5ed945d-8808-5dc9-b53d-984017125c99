@@ -11,10 +11,16 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from . import db, ingest
+from . import db, ingest, review_groups
 from .config import Settings, get_settings
 from .matcher import candidate_to_dict, match_address, result_to_dict
-from .schemas import AddressBatchIn, BatchMatchRequest, MatchRequest, ReviewAction
+from .schemas import (
+    AddressBatchIn,
+    BatchMatchRequest,
+    GroupReviewAction,
+    MatchRequest,
+    ReviewAction,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -319,3 +325,45 @@ def review_match(match_id: int, payload: ReviewAction,
         )
     return {"ok": True, "match_id": match_id, "action": payload.action,
             "selected_id": payload.selected_id}
+
+
+# --- same-case merged review ------------------------------------------------
+
+
+@app.get("/api/review-groups")
+def list_review_groups(
+    conn: db.sqlite3.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """待确认记录按归一化道路/地区词元、门牌号归组（候选 ID/顺序/得分须一致）。"""
+    groups = review_groups.compute_groups(conn)
+    return {
+        "needs_review": db.count_match_logs(conn, "needs_review"),
+        "total_groups": len(groups),
+        "groups": groups,
+    }
+
+
+@app.post("/api/review-groups/review")
+def review_group(payload: GroupReviewAction,
+                 conn: db.sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
+    """对整组执行确认首选 / 改派共同候选 / 判无匹配。
+
+    服务端在同一个 SQLite 写事务内重新核对成员仍待确认、组签名与成员集合
+    未变；若有变化返回 409 冲突且一条也不写入。
+    """
+    if payload.action == "overridden" and payload.selected_id is not None:
+        if db.get_address(conn, payload.selected_id) is None:
+            raise HTTPException(status_code=404, detail="所选标准地址不存在")
+    try:
+        result = review_groups.apply_group_review(
+            conn,
+            group_key=payload.group_key,
+            match_ids=payload.match_ids,
+            action=payload.action,
+            selected_id=payload.selected_id,
+        )
+    except review_groups.GroupConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except review_groups.GroupReviewError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, **result}

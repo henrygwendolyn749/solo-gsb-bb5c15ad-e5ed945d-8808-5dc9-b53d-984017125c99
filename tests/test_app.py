@@ -365,3 +365,166 @@ def test_preview_invalid_lines_use_physical_numbers(client):
     assert data["valid"] == 1
     assert data["invalid"] == 1
     assert data["invalid_lines"] == [4]
+
+
+# ------------------------------------------------- same-case merged review
+
+
+def _match_pending(client, query: str) -> int:
+    r = client.post("/api/match", json={"query": query})
+    data = r.json()
+    assert data["status"] == "needs_review", data
+    return data["match_id"]
+
+
+def _group_by_house(client, house: str) -> dict:
+    r = client.get("/api/review-groups")
+    assert r.status_code == 200
+    matches = [g for g in r.json()["groups"] if g["house"] == house]
+    assert len(matches) == 1, matches
+    return matches[0]
+
+
+def test_review_groups_merge_same_case_and_confirm(client):
+    # Three differently-written queries that normalise to the same
+    # road/locality tokens + house number and therefore share one group.
+    ids = [
+        _match_pending(client, "300 Lake Dr, Austin TX"),
+        _match_pending(client, "No. 300 Lake Dr, Austin TX"),
+        _match_pending(client, "300 LAKE DR, AUSTIN TX"),
+    ]
+    g = _group_by_house(client, "300")
+    assert g["count"] == 3
+    assert sorted(g["match_ids"]) == sorted(ids)
+    # the group exposes the original queries of its members
+    assert {m["query"] for m in g["queries"]} == {
+        "300 Lake Dr, Austin TX",
+        "No. 300 Lake Dr, Austin TX",
+        "300 LAKE DR, AUSTIN TX",
+    }
+    assert g["street_tokens"] == ["dr", "lake"]
+    assert g["locality_tokens"] == ["austin", "tx"]
+
+    r = client.post("/api/review-groups/review", json={
+        "group_key": g["group_key"], "match_ids": g["match_ids"],
+        "action": "confirmed",
+    })
+    assert r.status_code == 200
+    assert r.json()["reviewed"] == 3
+    for mid in ids:
+        d = client.get(f"/api/matches/{mid}").json()
+        assert d["status"] == "reviewed"
+        assert d["review_action"] == "confirmed"
+        assert d["selected_id"] == d["candidate_id"]
+
+    # the whole group left the pending queue
+    houses = [g2["house"] for g2 in client.get("/api/review-groups").json()["groups"]]
+    assert "300" not in houses
+
+
+def test_review_group_override_and_stale_member_set(client):
+    ids = [
+        _match_pending(client, "301 Lake Dr, Austin TX"),
+        _match_pending(client, "301 Lake Drive, Austin TX"),
+    ]
+    g = _group_by_house(client, "301")
+    assert sorted(g["match_ids"]) == sorted(ids)
+    second = g["candidates"][1]["address"]["id"]
+    second_score = g["candidates"][1]["score"]
+
+    # stale member set -> conflict, and nothing is written
+    r = client.post("/api/review-groups/review", json={
+        "group_key": g["group_key"], "match_ids": ids + [999999],
+        "action": "overridden", "selected_id": second,
+    })
+    assert r.status_code == 409
+    for mid in ids:
+        assert client.get(f"/api/matches/{mid}").json()["status"] == "needs_review"
+
+    # the override target must be one of the shared candidates
+    r = client.post("/api/review-groups/review", json={
+        "group_key": g["group_key"], "match_ids": ids,
+        "action": "overridden", "selected_id": 1,
+    })
+    assert r.status_code == 400
+    for mid in ids:
+        assert client.get(f"/api/matches/{mid}").json()["status"] == "needs_review"
+
+    # the real override applies the same decision + score to every member
+    r = client.post("/api/review-groups/review", json={
+        "group_key": g["group_key"], "match_ids": ids,
+        "action": "overridden", "selected_id": second,
+    })
+    assert r.status_code == 200
+    assert r.json()["reviewed"] == 2
+    for mid in ids:
+        d = client.get(f"/api/matches/{mid}").json()
+        assert d["status"] == "reviewed"
+        assert d["review_action"] == "overridden"
+        assert d["selected_id"] == second
+        assert d["score"] == second_score
+
+
+def test_review_group_member_reviewed_individually_conflicts(client):
+    ids = [
+        _match_pending(client, "302 Lake Dr, Austin TX"),
+        _match_pending(client, "302 LAKE DR, AUSTIN TX"),
+    ]
+    g = _group_by_house(client, "302")
+
+    # one member gets reviewed through the original single-record endpoint
+    r = client.post(f"/api/matches/{ids[0]}/review", json={"action": "rejected"})
+    assert r.status_code == 200
+
+    # the group review now conflicts and writes nothing at all
+    r = client.post("/api/review-groups/review", json={
+        "group_key": g["group_key"], "match_ids": ids, "action": "confirmed",
+    })
+    assert r.status_code == 409
+    assert client.get(f"/api/matches/{ids[1]}").json()["status"] == "needs_review"
+
+
+def test_review_group_reject(client):
+    ids = [
+        _match_pending(client, "303 Lake Dr, Austin TX"),
+        _match_pending(client, "No. 303 Lake Dr, Austin TX"),
+    ]
+    g = _group_by_house(client, "303")
+    r = client.post("/api/review-groups/review", json={
+        "group_key": g["group_key"], "match_ids": ids, "action": "rejected",
+    })
+    assert r.status_code == 200
+    assert r.json()["reviewed"] == 2
+    for mid in ids:
+        d = client.get(f"/api/matches/{mid}").json()
+        assert d["status"] == "reviewed"
+        assert d["review_action"] == "rejected"
+        assert d["selected_id"] is None
+
+
+def test_review_groups_split_when_candidates_differ(client):
+    # Same normalised key, but the address table changes in between so the
+    # candidate IDs/order/scores differ -> the records must NOT share a group.
+    first_id = _match_pending(client, "304 Lake Dr, Austin TX")
+    r = client.post("/api/addresses", json={"addresses": [
+        {"address": "305 Lake Drive, Austin, TX 73301", "external_id": "GRP-305"},
+    ]})
+    assert r.json()["inserted"] == 1
+    second_id = _match_pending(client, "304 LAKE DR, AUSTIN TX")
+
+    groups = [g for g in client.get("/api/review-groups").json()["groups"]
+              if g["house"] == "304"]
+    assert len(groups) == 2
+    assert all(g["count"] == 1 for g in groups)
+    assert {g["match_ids"][0] for g in groups} == {first_id, second_id}
+    assert groups[0]["group_key"] != groups[1]["group_key"]
+
+    # a singleton group can still be reviewed as a group (member set of one)
+    g1 = next(g for g in groups if g["match_ids"] == [first_id])
+    r = client.post("/api/review-groups/review", json={
+        "group_key": g1["group_key"], "match_ids": [first_id],
+        "action": "confirmed",
+    })
+    assert r.status_code == 200
+    assert r.json()["reviewed"] == 1
+    assert client.get(f"/api/matches/{first_id}").json()["status"] == "reviewed"

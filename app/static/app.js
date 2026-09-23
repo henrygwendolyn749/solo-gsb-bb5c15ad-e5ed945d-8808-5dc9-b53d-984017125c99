@@ -434,6 +434,11 @@ async function loadReview() {
     const status = $("#review-filter").value;
     const list = $("#review-list");
     list.innerHTML = '<p class="muted">加载中…</p>';
+    if (status === "needs_review") {
+        loadReviewGroups();
+    } else {
+        $("#review-groups").innerHTML = "";
+    }
     try {
         const data = await api(`/api/matches?status=${encodeURIComponent(status)}&limit=100`);
         if (data.items.length === 0) {
@@ -471,6 +476,93 @@ $("#review-filter").addEventListener("change", loadReview);
 $("#review-list").addEventListener("click", async (event) => {
     await onReviewClick(event);
     if (event.target.closest("button[data-log]")) loadReview();
+});
+
+// ------------------------------------------------- same-case merged review
+
+// Groups fetched by the last loadReviewGroups() call, keyed lookup for actions.
+let reviewGroups = [];
+
+function renderGroup(group) {
+    const queries = group.queries.map((m) => `
+        <div class="gq">🔍 ${escapeHtml(m.query)}
+            <span class="muted">记录 #${m.id}</span>
+        </div>`).join("");
+    const candidates = group.candidates
+        .map((c, i) => renderCandidate(c, i, {}))
+        .join("") || '<div class="meta muted">无候选</div>';
+    const best = group.candidates[0];
+    const options = group.candidates.map((c) =>
+        `<option value="${c.address.id}">#${c.address.id} · ${pct(c.score)} · ` +
+        `${escapeHtml(c.address.full_text)}</option>`).join("");
+    return `
+    <div class="review-group" data-group="${escapeHtml(group.group_key)}">
+        <div class="group-head">
+            <span class="group-badge">同案组 × ${group.count}</span>
+            <span class="muted">
+                归一化：道路 [${escapeHtml(group.street_tokens.join(" ") || "—")}]
+                · 地区 [${escapeHtml(group.locality_tokens.join(" ") || "—")}]
+                · 门牌号 ${escapeHtml(group.house || "无")}
+            </span>
+        </div>
+        <div class="group-queries">${queries}</div>
+        ${candidates}
+        <div class="review-actions">
+            ${best ? `<button class="tiny confirm group-action" data-action="confirmed">
+                整组确认首选（#${best.address.id}）</button>` : ""}
+            ${options ? `
+                <select class="group-select">${options}</select>
+                <button class="tiny override group-action" data-action="overridden">整组改派所选候选</button>` : ""}
+            <button class="tiny reject group-action" data-action="rejected">整组判无匹配</button>
+        </div>
+    </div>`;
+}
+
+async function loadReviewGroups() {
+    const box = $("#review-groups");
+    box.innerHTML = '<p class="muted">加载同案组…</p>';
+    try {
+        const data = await api("/api/review-groups");
+        reviewGroups = data.groups || [];
+        const merged = reviewGroups.filter((g) => g.count >= 2);
+        if (merged.length === 0) {
+            box.innerHTML = '<p class="muted">暂无可合并的同案组：归一化后道路/地区词元、' +
+                '门牌号一致且候选（ID、顺序、得分）完全相同的待确认记录会归到同组。</p>';
+            return;
+        }
+        box.innerHTML =
+            `<h3 class="group-title">同案合并复核（${merged.length} 组）</h3>` +
+            merged.map(renderGroup).join("");
+    } catch (err) {
+        box.innerHTML = `<p class="err-msg">${escapeHtml(err.message)}</p>`;
+    }
+}
+
+$("#review-groups").addEventListener("click", async (event) => {
+    const btn = event.target.closest("button.group-action");
+    if (!btn) return;
+    const card = btn.closest(".review-group");
+    const key = card.dataset.group;
+    const group = reviewGroups.find((g) => g.group_key === key);
+    if (!group) return;
+    const action = btn.dataset.action;
+    const body = { group_key: key, match_ids: group.match_ids, action };
+    if (action === "overridden") {
+        body.selected_id = Number(card.querySelector(".group-select").value);
+    }
+    btn.disabled = true;
+    try {
+        const res = await api("/api/review-groups/review", {
+            method: "POST",
+            body: JSON.stringify(body),
+        });
+        await refreshHealth();
+        loadReview();
+    } catch (err) {
+        // 409：组签名或成员集合已变化，一条也未写入，刷新展示最新状态。
+        alert(err.message);
+        loadReview();
+    }
 });
 
 // ------------------------------------------------------------------ health

@@ -48,3 +48,11 @@ class AddressBatchIn(BaseModel):
 class ReviewAction(BaseModel):
     action: str = Field(..., pattern="^(confirmed|overridden|rejected)$")
     selected_id: int | None = None
+
+
+class GroupReviewAction(BaseModel):
+    """整组复核请求：group_key 为组签名，match_ids 为客户端看到的成员集合。"""
+    group_key: str = Field(..., min_length=1)
+    match_ids: list[int] = Field(..., min_length=1)
+    action: str = Field(..., pattern="^(confirmed|overridden|rejected)$")
+    selected_id: int | None = None

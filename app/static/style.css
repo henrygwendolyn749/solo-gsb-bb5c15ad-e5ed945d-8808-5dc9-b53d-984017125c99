@@ -170,3 +170,25 @@ th { color: var(--muted); font-weight: 600; }
 .muted { color: var(--muted); font-size: 12px; }
 .ok-msg { color: var(--green); font-size: 13px; }
 .err-msg { color: var(--red); font-size: 13px; }
+
+/* same-case merged review groups */
+.group-title { margin: 18px 0 4px; font-size: 14px; }
+.review-group {
+    border: 1px solid var(--primary); border-radius: 10px;
+    padding: 14px; margin-top: 12px; background: #fbfcff;
+}
+.group-head { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.group-badge {
+    font-size: 12px; font-weight: 600; padding: 3px 12px; border-radius: 999px;
+    background: var(--primary); color: #fff;
+}
+.group-queries {
+    margin-top: 8px; padding: 8px 12px; border-radius: 8px;
+    background: var(--gray-bg); font-size: 13px;
+}
+.group-queries .gq { padding: 2px 0; word-break: break-all; }
+.group-queries .gq + .gq { border-top: 1px dashed var(--line); }
+.group-select {
+    width: auto; max-width: 320px; padding: 5px 8px;
+    font-size: 12px; border-radius: 6px;
+}
